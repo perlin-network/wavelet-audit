@@ -1,0 +1,46 @@
+#! /usr/bin/env bash
+
+dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit 1
+bindir="${dir}/../../bin"
+
+if [ "$#" -lt '1' ]; then
+	echo "Usage: main <id>" >&2
+	exit 1
+fi
+
+name="$1"
+id="$(echo "${name}" | sed 's@^.*-@@')"
+
+port=3000
+apiPort=9930
+
+addArgs=()
+addArgs+=( $(sort --random-sort remote-ips | awk -v port="${port}" '{ print "[" $1 "]:" port }') )
+
+(
+	while true; do
+		if [ -e cmd ]; then
+			break
+		fi
+		sleep 1
+	done
+
+	while true; do
+		if grep 'Started HTTP API server.' output >/dev/null 2>/dev/null; then
+			break
+		fi
+		sleep 1
+	done
+
+	count=-1
+	while true; do
+		count=$[$count + 1]
+		random="$(openssl rand -hex 32)"
+		echo "pay ${random} 1"
+		if [ $[$count % 1000] = 0 ]; then
+			echo 'status'
+		fi
+	done > cmd
+) &
+
+"${bindir}"/wavelet_wrap ./cmd --api.port "${apiPort}" --port "${port}" --db "$(pwd)/DB" --host "$(cat local-ip)" "${addArgs[@]}"

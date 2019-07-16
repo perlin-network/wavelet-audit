@@ -1,0 +1,6 @@
+order=(splitter tarpit reflector good spammer)
+nodes["good"]=5
+nodes["splitter"]=5
+nodes["tarpit"]=5
+nodes["reflector"]=5
+nodes["spammer"]=2

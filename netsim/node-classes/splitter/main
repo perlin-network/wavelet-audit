@@ -1,0 +1,31 @@
+#! /usr/bin/env bash
+
+dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit 1
+bindir="${dir}/../../bin"
+
+if [ "$#" -lt '1' ]; then
+	echo "Usage: main <id>" >&2
+	exit 1
+fi
+
+name="$1"
+id="$(echo "${name}" | sed 's@^.*-@@')"
+
+port=3000
+apiPort=9930
+
+addArgs=()
+addArgs+=(--wallet 36f77e6b81a449cdabe352297d2995df9baa6a2afca597422432b011d061a98010d7244186b504b466ea8c9795f12bcf896cc47746b55a93ea4a3b826f79ed1f)
+
+addArgs+=( $(sort --random-sort remote-ips | awk -v port="${port}" '{ print "[" $1 "]:" port }') )
+
+(
+	while true; do
+		date
+		"${bindir}"/wctl ledger_status --api.port "${apiPort}" --key 00
+		echo '------------'
+		sleep 60
+	done
+) &
+
+"${bindir}"/wavelet_wrap ./cmd --api.port "${apiPort}" --port "${port}" --db "$(pwd)/DB" --host "$(cat local-ip)" "${addArgs[@]}"

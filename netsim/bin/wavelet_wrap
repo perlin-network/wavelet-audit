@@ -1,0 +1,22 @@
+#! /usr/bin/env tclsh
+
+set dirname [file dirname [info script]]
+set bin [file join $dirname wavelet]
+
+set fifo [lindex $argv 0]
+set argv [lrange $argv 1 end]
+
+file delete -force $fifo
+exec mkfifo $fifo
+
+set cmd_fd [open "|[list $bin {*}$argv 2>@1]" w+]
+set fifo_fd [open $fifo w+]
+
+proc finished {args} {
+	exit
+}
+
+fcopy $cmd_fd stdout -command finished
+fcopy $fifo_fd $cmd_fd -command finished
+
+vwait forever

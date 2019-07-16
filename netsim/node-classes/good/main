@@ -1,0 +1,46 @@
+#! /usr/bin/env bash
+
+dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit 1
+bindir="${dir}/../../bin"
+
+if [ "$#" -lt '1' ]; then
+	echo "Usage: main <id>" >&2
+	exit 1
+fi
+
+name="$1"
+id="$(echo "${name}" | sed 's@^.*-@@')"
+
+port=3000
+apiPort=9930
+
+addArgs=()
+case "${id}" in
+	0)
+		addArgs+=(--wallet 52bccdd6b765f3b65b76c470ce9f1cdacdbda4fbe2a9a6de6cd7e6cf3e49388c5ba4a4424f7ecefd5609e0b7aff6419158aef2eb85cb47f9c8b9442649ade179)
+		;;
+	x)
+		addArgs+=(--wallet 36f77e6b81a449cdabe352297d2995df9baa6a2afca597422432b011d061a98010d7244186b504b466ea8c9795f12bcf896cc47746b55a93ea4a3b826f79ed1f)
+		;;
+esac
+
+addArgs+=( $(sort --random-sort remote-ips | awk -v port="${port}" '{ print "[" $1 "]:" port }') )
+
+(
+	while true; do
+		date
+		"${bindir}"/wctl ledger_status --api.port "${apiPort}" --key 00
+		if [ -e cmd ]; then
+			(
+				"${bindir}"/wctl ledger_status --api.port "${apiPort}" --key 00 | jq  -rM '.peers[] | fromjson | .public_key' | sort --random-sort | while IFS='' read -r pubKey; do
+					echo "pay ${pubKey} 1000000"
+				done
+				echo status
+			) > cmd
+		fi
+		echo '------------'
+		sleep 60
+	done
+) &
+
+"${bindir}"/wavelet_wrap ./cmd --api.port "${apiPort}" --port "${port}" --db "$(pwd)/DB" --host "$(cat local-ip)" "${addArgs[@]}"

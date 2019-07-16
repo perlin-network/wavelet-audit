@@ -1,0 +1,3 @@
+order=(tarpit good)
+nodes["good"]=20
+nodes["tarpit"]=325

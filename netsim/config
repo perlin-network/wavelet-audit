@@ -1,0 +1,46 @@
+PATH="/opt/go/bin:/sbin:/usr/sbin:/usr/local/sbin:/bin:/usr/bin:/usr/local/bin:${PATH}"
+GOPATH="${basedir}/.go"
+export PATH GOPATH
+
+_real_ip="$(command -v ip)"
+function ip() {
+	local arg
+
+	arg="$1"
+
+	case "$arg" in
+		netns)
+			;;
+		*)
+			sudo "${_real_ip}" "$@"
+			return "$?"
+			;;
+	esac
+
+	shift
+	arg="$1"
+	case "${arg}" in
+		exec)
+			;;
+		*)
+			sudo "${_real_ip}" netns "$@"
+			return "$?"
+	esac
+
+	shift
+	arg="$1"
+	shift
+
+	# This is not precisely the right test as any arguments passed to "sudo"
+	# will not be consumed
+	if [ "$1" = 'sudo' ]; then
+		sudo "${_real_ip}" netns exec "${arg}" "$@"
+	else
+		sudo "${_real_ip}" netns exec "${arg}" sudo -u "#${UID}" "$@"
+	fi
+}
+
+_real_sysctl="$(command -v sysctl)"
+function sysctl() {
+	sudo "${_real_sysctl}" "$@"
+}

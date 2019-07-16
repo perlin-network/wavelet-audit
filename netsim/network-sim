@@ -1,0 +1,365 @@
+#! /usr/bin/env bash
+
+# XXX:TODO: Support noise with this disabled
+canonicalizeIPs='true'
+
+basedir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit 1
+playbookdir="${basedir}/playbooks"
+classdir="${basedir}/node-classes"
+config="${basedir}/config"
+namespaceIPULAPrefix='fdbc:dba5:e24b'
+
+if [ "$#" != '1' ]; then
+	echo "Usage: network-sim <playbook>" >&2
+	exit 1
+fi
+
+playbookName="$1"
+simulationName="${playbookName}"
+simulationWorkDir="${basedir}/work/${simulationName}-$(date +%Y%m%d%H%M)"
+
+# Compute the ULA internal or external IP of an instance
+function computeIP() {
+	local type classIndex instanceIndex
+	local lastByte
+
+	type="$1"
+	classIndex="$2"
+	instanceIndex="$3"
+
+	case "${type}" in
+		external)
+			lastByte='1'
+			;;
+		internal)
+			lastByte='2'
+			;;
+		network)
+			lastByte=''
+			;;
+		*)
+			echo "Invalid type (${type}), must be external, internal, or network" >&2
+			return 1
+			;;
+	esac
+
+	printf "${namespaceIPULAPrefix}:%01x%03x::${lastByte}" "${classIndex}" "${instanceIndex}" | (
+		if [ "${canonicalizeIPs}" = 'true' ]; then
+			sed 's@:00*@:@g;s@:::*@::@g'
+		else
+			cat
+		fi
+	)
+
+	return 0
+}
+
+function namespaceName() {
+	local className instanceIndex
+	local namespaceName
+
+	className="$1"
+	instanceIndex="$2"
+
+	namespaceName="sim-${simulationName}-${class}-${idx}"
+
+	echo "${namespaceName}"
+
+	return 0
+}
+
+function namespaceIfaceName() {
+	local namespaceName
+	local namespaceIfaceName
+
+	namespaceName="$1"
+
+	namespaceIfaceName="sim-$(echo "${namespaceName}" | openssl sha1 | sed 's@.*= *@@' | cut -c 1-8)"
+
+	echo "${namespaceIfaceName}"
+
+	return 0
+}
+
+function cleanNamespace() {
+	local namespaceName
+	local namespaceIfaceName
+
+	namespaceName="$1"
+
+	namespaceIfaceName="$(namespaceIfaceName "${namespaceName}")"
+
+	ip link delete "${namespaceIfaceName}" >/dev/null 2>/dev/null || :
+	if ip netns pids "${namespaceName}" >/dev/null 2>/dev/null; then
+		ip netns delete "${namespaceName}"
+	fi
+}
+
+function cleanup() {
+	# Clean up
+	echo "Cleaning up..."
+	set +e
+	for namespaceName in "${instanceNamespaces[@]}"; do
+		cleanNamespace "${namespaceName}"
+	done
+}
+
+set -e
+
+# Load config, which may override many things
+if [ -e "${config}" ]; then
+	. "${config}"
+fi
+
+# Allow explicit cleanup
+if [ "${playbookName}" = 'clean' -o "${playbookName}" = 'distclean' ]; then
+	set +e
+	cleanTarget="${playbookName}"
+	for dir in "${classdir}"/*; do
+		if [ ! -d "${dir}" ]; then
+			continue
+		fi
+
+		(
+			set -e
+
+			cd "${dir}"
+
+			if [ -e 'Makefile' ]; then
+				make "${cleanTarget}"
+			else
+				if [ "$(echo *.go)" != '*.go' ]; then
+					rm -f main
+				fi
+				rm -rf vendor
+			fi
+		)
+	done
+
+	if [ "${cleanTarget}" = 'distclean' ]; then
+		if [ -d "${basedir}/.go" ]; then
+			chmod -R u+rwX "${basedir}/.go"
+			rm -rf "${basedir}/.go"
+		fi
+	fi
+
+	for namespaceName in $(ip netns list | awk '/^sim-/{ print $1 }'); do
+		cleanNamespace "${namespaceName}"
+	done
+
+	exit 0
+fi
+
+
+# Load the playbook
+## Find the path to the playbook data directory
+playbook="${playbookdir}/${playbookName}"
+
+if [ ! -f "${playbook}" ]; then
+	echo "Playbook: ${playbook} not found" >&2
+	exit 1
+fi
+
+## Load the playbook data
+unset nodes order delay packet_capture
+declare -A nodes
+eval "$(
+	. "${playbook}"
+	set | egrep '^(nodes|order|delay|packet_capture)='
+)"
+
+# Generate list of classes
+if [ -n "${order[*]}" ]; then
+	classes=("${order[@]}")
+else
+	classes=("${!nodes[@]}")
+fi
+
+# For each class of node, compile the driver for it
+declare -A drivers
+for class in "${classes[@]}"; do
+	(
+		cd "${classdir}/${class}"
+		if [ -f 'Makefile' ]; then
+			make
+		else
+			if [ ! -x main ]; then
+				export GO111MODULE=on
+
+				echo "Rebuilding ${class}" >&2
+				set -x
+
+#				if [ -f 'go.mod' ]; then
+#					go mod vendor
+#				fi
+
+				go get -d ./...
+
+				go build -o main
+			fi
+		fi
+	)
+
+	drivers["${class}"]="${classdir}/${class}/main"
+done
+
+# Get a list of all node IPs
+classIndex='-1'
+instancesIPList=()
+for class in "${classes[@]}"; do
+	classIndex=$[${classIndex} + 1]
+
+	for ((idx = 0; idx < ${nodes["${class}"]}; idx++)); do
+		namespaceIPInt="$(computeIP internal "${classIndex}" "${idx}")"
+		instanceIPList+=("${namespaceIPInt}")
+	done
+done
+
+# Initialize routing
+sysctl -qw net.ipv4.ip_forward=1
+sysctl -qw net.ipv6.conf.all.forwarding=1
+
+# Start the simulation
+echo "Starting simulation..."
+declare -A instanceWorkDirs
+classIndex='-1'
+instancePIDs=()
+instanceNamespaces=()
+trap cleanup EXIT
+for class in "${classes[@]}"; do
+	classIndex=$[${classIndex} + 1]
+	driver="${drivers["${class}"]}"
+
+	# Initialize the network namespace for this simulation 
+	for ((idx = 0; idx < ${nodes["${class}"]}; idx++)); do
+		namespaceName="$(namespaceName "${class}" "${idx}")"
+		echo "   ${namespaceName}..."
+
+		namespaceIfaceName="$(namespaceIfaceName "${namespaceName}")"
+		namespaceIPExt="$(computeIP external "${classIndex}" "${idx}")"
+		namespaceIPInt="$(computeIP internal "${classIndex}" "${idx}")"
+		instanceWorkDir="${simulationWorkDir}/${class}-${idx}"
+		instanceWorkDirs["${namespaceName}"]="${instanceWorkDir}"
+		instanceNamespaces+=("${namespaceName}")
+
+		# Cleanup from previous runs
+		cleanNamespace "${namespaceName}"
+
+		# Create new namespace
+		ip netns add "${namespaceName}"
+		ip netns exec "${namespaceName}" sudo ip link set lo up
+
+		# Create interfaces
+		ip link add name "${namespaceIfaceName}" type veth peer name "I${namespaceIfaceName}"
+		ip link set "I${namespaceIfaceName}" netns "${namespaceName}" name eth0
+
+		# Assign IPs to interfaces
+		ip -f inet6 addr add "${namespaceIPExt}/64" dev "${namespaceIfaceName}"
+		ip netns exec "${namespaceName}" sudo ip -f inet6 addr add "${namespaceIPInt}/64" dev eth0
+
+		# Bring interfaces online
+		ip link set "${namespaceIfaceName}" up
+		ip netns exec "${namespaceName}" sudo ip link set eth0 up
+
+		# Add a route between instances
+		ip netns exec "${namespaceName}" sudo ip -f inet6 route add "${namespaceIPULAPrefix}::/48" via "${namespaceIPExt}"
+
+		# Create a working directory for this instance and put some useful information there
+		rm -rf "${instanceWorkDir}"
+		mkdir -p "${instanceWorkDir}"
+		echo "${namespaceIPInt}" > "${instanceWorkDir}/local-ip"
+
+		for remoteIP in "${instanceIPList[@]}"; do
+			if [ "${remoteIP}" = "${namespaceIPInt}" ]; then
+				continue
+			fi
+
+			echo "${remoteIP}"
+		done > "${instanceWorkDir}/remote-ips"
+
+		# Perform initialization
+		# XXX:TODO: Install firewall rules
+		# XXX:TODO: Install tc QoS/Policing rules
+
+		# Start the instance
+		(
+			set -x
+			cd "${instanceWorkDir}" || exit 1
+
+			if [ "${packet_capture}" = 'true' ]; then
+				ip netns exec "${namespaceName}" sudo tcpdump -Z "$(id -un)" -s 8192 -w packets.pcap >/dev/null 2>/dev/null &
+				pcapPID="$!"
+			fi
+
+			ip netns exec "${namespaceName}" "${driver}" "${namespaceName}" </dev/zero > output 2>&1
+			exitCode="$?"
+
+			if [ "${packet_capture}" = 'true' ]; then
+				sleep 1
+
+				kill -9 "${pcapPID}" >/dev/null 2>/dev/null
+			fi
+
+			if [ ! -e exit-code ]; then
+				echo "${exitCode}" > exit-code
+			fi
+		) > "${instanceWorkDir}/monitor-output" 2>&1 &
+		instancePIDs+=("$!")
+
+		if [ -n "${delay}" ]; then
+			sleep "${delay}"
+		fi
+	done
+done
+
+# Initialize routing a second time, for good measure
+sysctl -qw net.ipv4.ip_forward=1
+sysctl -qw net.ipv6.conf.all.forwarding=1
+
+# Wait for the jobs to terminate
+terminatedNamespaceNames=()
+while true; do
+	wait -n || :
+
+	stillRunning='false'
+	for namespaceName in "${instanceNamespaces[@]}"; do
+		namespacePIDList="$(ip netns pids "${namespaceName}" 2>/dev/null || :)"
+
+		if [ -n "${namespacePIDList}" ]; then
+			stillRunning='true'
+			continue
+		fi
+
+		newlyTerminated='true'
+		for checkNamespaceName in "${terminatedNamespaceNames[@]}"; do
+			if [ "${checkNamespaceName}" = "${namespaceName}" ]; then
+				newlyTerminated='false'
+				break
+			fi
+		done
+
+		if [ "${newlyTerminated}" = 'true' ]; then
+			instanceWorkDir="${instanceWorkDirs["${namespaceName}"]}"
+			exitCode="$(cat "${instanceWorkDir}/exit-code" 2>&1 || :)"
+			if [ "${exitCode}" != '0' ]; then
+				exitMessage="exited in failure (${exitCode})"
+			else
+				exitMessage='exited'
+			fi
+
+			echo "   ${namespaceName} ${exitMessage}..."
+
+			terminatedNamespaceNames+=("${namespaceName}")
+		fi
+	done
+
+	if [ "${stillRunning}" != 'true' ]; then
+		break
+	fi
+
+	sleep 1
+done
+
+# Declare victory
+echo "Done."
+exit 0
